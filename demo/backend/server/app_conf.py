@@ -9,7 +9,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-APP_ROOT = os.getenv("APP_ROOT", "/opt/sam2")
+APP_ROOT = os.getenv("APP_ROOT", "./sam2")
 
 API_URL = os.getenv("API_URL", "http://localhost:7263")
 
@@ -20,7 +20,7 @@ logger.info(f"using model size {MODEL_SIZE}")
 FFMPEG_NUM_THREADS = int(os.getenv("FFMPEG_NUM_THREADS", "1"))
 
 # Path for all data used in API
-DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+DATA_PATH = Path(os.getenv("DATA_PATH", "./data"))
 
 # Max duration an uploaded video can have in seconds. The default is 10
 # seconds.
