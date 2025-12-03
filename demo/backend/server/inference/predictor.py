@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import uuid
+import base64
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Generator, List
@@ -34,8 +35,13 @@ from inference.data_types import (
     StartSessionResponse,
 )
 from pycocotools.mask import decode as decode_masks, encode as encode_masks
-from sam2.build_sam import build_sam2_video_predictor
-
+from sam2.build_sam import build_sam2_video_predictor, build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+from PIL import Image
+import requests
+from io import BytesIO
+import cv2
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +95,116 @@ class InferenceAPI:
         self.predictor = build_sam2_video_predictor(
             model_cfg, checkpoint, device=device
         )
+        sam2_model = build_sam2(model_cfg, checkpoint, device=device)
+        self.img_predictor = SAM2ImagePredictor(sam2_model)
+        self.mask_generator = SAM2AutomaticMaskGenerator(
+            sam2_model,
+            points_per_side=32,
+            points_per_batch=64,
+            pred_iou_thresh=0.7,
+            stability_score_thresh=0.92,
+            stability_score_offset=0.7,
+            crop_n_layers=1,
+            box_nms_thresh=0.7,
+            crop_n_points_downscale_factor=2,
+            min_mask_region_area=100.0,
+            use_m2m=True
+        )
+        self.current_img = None
         self.inference_lock = Lock()
+
+    def _load_image(self, image_input: str) -> Image.Image:
+        """Load an image from a data URI, local path, or URL."""
+        if image_input.startswith("data:"):
+            header, encoded = image_input.split(",", 1)
+            return Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
+
+        local_path = Path(image_input)
+        if local_path.exists():
+            return Image.open(local_path).convert("RGB")
+
+        response = requests.get(image_input)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert("RGB")
+
+    def predict_image(self,url:str,input_points:List[List[int]],input_labels:List[int],input_box:List[List[int]],multimask_output:bool):
+        print(url[:50],input_points,input_labels,input_box,multimask_output)
+        with self.inference_lock:
+            if self.current_img != url:
+                img = self._load_image(url)
+                self.img_predictor.set_image(img)
+                self.current_img = url            
+            masks, scores, logits = self.img_predictor.predict(
+                point_coords=np.array(input_points),
+                point_labels=np.array(input_labels),
+                box = np.array(input_box) if isinstance(input_box,List) else None,
+                multimask_output=multimask_output)
+            sorted_ind = np.argsort(scores)[::-1]
+            masks = masks[sorted_ind]
+            scores = scores[sorted_ind]
+            logits = logits[sorted_ind]
+            mask = Image.fromarray(masks[0].astype(np.uint8) * 255)
+            byte_io = BytesIO()
+            mask.save(byte_io, format="JPEG")
+            byte_io.seek(0)
+            return byte_io.getvalue()
+
+    def generate_masks(self, url:str):
+        print(url[:50])
+        with self.inference_lock:
+            img = self._load_image(url)
+            masks = self.mask_generator.generate(np.array(img))              
+            print(len(masks))
+
+            maskImgArr = self.combine_masks(masks)
+            mask = Image.fromarray((maskImgArr * 255).astype(np.uint8), 'RGBA')
+            byte_io = BytesIO()
+            mask.save(byte_io, format="PNG")
+            byte_io.seek(0)
+            return byte_io.getvalue()
+
+    def save_masks_to_dir(
+        self, image_input: str, output_dir: Path, filename_prefix: str = "mask"
+    ) -> List[str]:
+        with self.autocast_context(), self.inference_lock:
+            img = self._load_image(image_input)
+            masks = self.mask_generator.generate(np.array(img))
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        saved_files: List[str] = []
+        for idx, ann in enumerate(masks):
+            segmentation = ann.get("segmentation")
+            if segmentation is None:
+                continue
+            mask_arr = np.array(segmentation).astype(np.uint8)
+            # squeeze potential extra dimensions (e.g., 1xHxW)
+            mask_arr = np.squeeze(mask_arr)
+            mask_img = Image.fromarray(mask_arr * 255)
+            file_name = f"{filename_prefix}_{idx:04d}.png"
+            mask_img.save(output_dir / file_name)
+            saved_files.append(file_name)
+
+        return saved_files
+        
+    def combine_masks(self, masks, borders=True):
+        if len(masks) == 0:
+            return
+        np.random.seed(3)
+        sorted_masks = sorted(masks, key=(lambda x: x['area']), reverse=True)
+
+        img = np.ones((sorted_masks[0]['segmentation'].shape[0], sorted_masks[0]['segmentation'].shape[1], 4))
+        img[:, :, 3] = 0
+        for ann in sorted_masks:
+            m = ann['segmentation']
+            color_mask = np.concatenate([np.random.random(3), [0.5]])
+            img[m] = color_mask 
+            if borders:                
+                contours, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE) 
+                # Try to smooth contours
+                contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
+                cv2.drawContours(img, contours, -1, (0, 0, 1, 0.4), thickness=1) 
+        print(img)
+        return img
 
     def autocast_context(self):
         if self.device.type == "cuda":
