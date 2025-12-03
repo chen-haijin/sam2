@@ -48,8 +48,13 @@ POSTERS_PREFIX = "posters"
 # Path where all posters are stored
 POSTERS_PATH = DATA_PATH / POSTERS_PREFIX
 
+# Prefix and path for temporary assets (e.g. generated masks)
+TEMP_PREFIX = "temp"
+TEMP_PATH = DATA_PATH / TEMP_PREFIX
+
 # Make sure any of those paths exist
 os.makedirs(DATA_PATH, exist_ok=True)
 os.makedirs(GALLERY_PATH, exist_ok=True)
 os.makedirs(UPLOADS_PATH, exist_ok=True)
 os.makedirs(POSTERS_PATH, exist_ok=True)
+os.makedirs(TEMP_PATH, exist_ok=True)
